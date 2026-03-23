@@ -1,0 +1,9 @@
+flask
+flask-cors
+numpy
+scipy
+scikit-learn
+pyserial
+requests
+customtkinter
+matplotlib

@@ -1,0 +1,8 @@
+{
+  "server_base": "http://localhost:5000/",
+  "serial_port": "COM8",
+  "serial_baud": 115200,
+  "scan_seconds": 20,
+  "model_file": "model.pkl",
+  "local_db": "pico_local.db"
+}

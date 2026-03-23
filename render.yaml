@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: cardioscan-api
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python api.py
+    autoDeploy: true
+    healthCheckPath: /api/health
