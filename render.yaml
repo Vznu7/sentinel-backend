@@ -8,3 +8,8 @@ services:
     startCommand: python api.py
     autoDeploy: true
     healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CARDIOSCAN_DATA_DIR
+        value: /var/data

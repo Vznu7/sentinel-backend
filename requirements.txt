@@ -7,3 +7,4 @@ pyserial
 requests
 customtkinter
 matplotlib
+psycopg2-binary

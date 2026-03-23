@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import sqlite3
 import time
@@ -11,6 +12,13 @@ import numpy as np
 import pickle
 from scipy.signal import butter, filtfilt, find_peaks, iirnotch
 from werkzeug.utils import secure_filename
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except Exception:
+    psycopg2 = None
+    RealDictCursor = None
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_ROOT, "ct_config.json")
@@ -39,6 +47,8 @@ def load_config():
 
 
 CFG = load_config()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
 
 # Storage root strategy:
 # 1) CARDIOSCAN_DATA_DIR env var (recommended on Render)
@@ -53,6 +63,61 @@ db_name_or_path = CFG.get("local_db", "pico_local.db")
 DB_PATH = db_name_or_path if os.path.isabs(db_name_or_path) else os.path.join(DATA_ROOT, db_name_or_path)
 DATA_DIR = os.path.join(DATA_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+class CursorAdapter:
+    def __init__(self, cursor, use_postgres=False):
+        self._cursor = cursor
+        self._use_postgres = use_postgres
+
+    def execute(self, query, params=()):
+        sql = query.replace("?", "%s") if self._use_postgres else query
+        self._cursor.execute(sql, params or ())
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cursor, "lastrowid", None)
+
+    def close(self):
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+
+
+class ConnectionAdapter:
+    def __init__(self, conn, use_postgres=False):
+        self._conn = conn
+        self._use_postgres = use_postgres
+
+    def cursor(self):
+        if self._use_postgres:
+            raw_cursor = self._conn.cursor(cursor_factory=RealDictCursor)
+        else:
+            raw_cursor = self._conn.cursor()
+        return CursorAdapter(raw_cursor, self._use_postgres)
+
+    def execute(self, query, params=()):
+        cur = self.cursor()
+        cur.execute(query, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
 
 app = Flask(__name__)
 CORS(app)
@@ -88,9 +153,15 @@ _model_mtime = None
 
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if USE_POSTGRES:
+        if psycopg2 is None:
+            raise RuntimeError("DATABASE_URL is set but psycopg2 is not installed")
+        raw_conn = psycopg2.connect(DATABASE_URL)
+        return ConnectionAdapter(raw_conn, use_postgres=True)
+
+    raw_conn = sqlite3.connect(DB_PATH)
+    raw_conn.row_factory = sqlite3.Row
+    return ConnectionAdapter(raw_conn, use_postgres=False)
 
 
 def bandpass(signal, fs, lowcut=0.5, highcut=40.0, order=3):
@@ -228,7 +299,7 @@ def extract_features_for_prediction(timestamps, ecg, red, ir):
     }
 
 
-def parse_scan_csv(csv_path):
+def _parse_scan_csv_stream(stream):
     import csv
 
     timestamps = []
@@ -236,32 +307,40 @@ def parse_scan_csv(csv_path):
     red = []
     ir = []
 
-    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
-        reader = csv.DictReader(f)
-        field_map = {name.strip().lower(): name for name in (reader.fieldnames or [])}
+    reader = csv.DictReader(stream)
+    field_map = {name.strip().lower(): name for name in (reader.fieldnames or [])}
 
-        ts_key = field_map.get("ts_ms") or field_map.get("ts")
-        ecg_key = field_map.get("ecg")
-        red_key = field_map.get("red")
-        ir_key = field_map.get("ir")
+    ts_key = field_map.get("ts_ms") or field_map.get("ts")
+    ecg_key = field_map.get("ecg")
+    red_key = field_map.get("red")
+    ir_key = field_map.get("ir")
 
-        if not all([ts_key, ecg_key, red_key, ir_key]):
-            raise ValueError("CSV must contain columns: ts_ms (or ts), ecg, red, ir")
+    if not all([ts_key, ecg_key, red_key, ir_key]):
+        raise ValueError("CSV must contain columns: ts_ms (or ts), ecg, red, ir")
 
-        for row in reader:
-            try:
-                timestamps.append(int(float(row.get(ts_key, 0))))
-                ecg.append(int(float(row.get(ecg_key, 0))))
-                red.append(int(float(row.get(red_key, 0))))
-                ir.append(int(float(row.get(ir_key, 0))))
-            except Exception:
-                continue
+    for row in reader:
+        try:
+            timestamps.append(int(float(row.get(ts_key, 0))))
+            ecg.append(int(float(row.get(ecg_key, 0))))
+            red.append(int(float(row.get(red_key, 0))))
+            ir.append(int(float(row.get(ir_key, 0))))
+        except Exception:
+            continue
 
     if len(timestamps) < 10:
         raise ValueError("CSV has insufficient valid samples")
 
     duration_sec = max(0.0, (timestamps[-1] - timestamps[0]) / 1000.0)
     return timestamps, ecg, red, ir, duration_sec
+
+
+def parse_scan_csv(csv_path):
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+        return _parse_scan_csv_stream(f)
+
+
+def parse_scan_csv_text(csv_text):
+    return _parse_scan_csv_stream(io.StringIO(csv_text or ""))
 
 
 def load_model():
@@ -462,52 +541,116 @@ def ensure_schema():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS scans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id INTEGER,
-            started_at TEXT,
-            finished_at TEXT,
-            raw_csv TEXT,
-            prediction TEXT,
-            explainable TEXT,
-            suggestion TEXT,
-            hr REAL,
-            sbp REAL,
-            dbp REAL,
-            ptt REAL,
-            hrv_rmssd REAL,
-            spo2 REAL,
-            breathing_rate REAL,
-            hr_status TEXT,
-            bp_status TEXT,
-            health_status TEXT,
-            risk_score INTEGER
+    if USE_POSTGRES:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scans (
+                id SERIAL PRIMARY KEY,
+                patient_id INTEGER,
+                started_at TEXT,
+                finished_at TEXT,
+                raw_csv TEXT,
+                raw_csv_text TEXT,
+                prediction TEXT,
+                explainable TEXT,
+                suggestion TEXT,
+                hr REAL,
+                sbp REAL,
+                dbp REAL,
+                ptt REAL,
+                hrv_rmssd REAL,
+                spo2 REAL,
+                breathing_rate REAL,
+                hr_status TEXT,
+                bp_status TEXT,
+                health_status TEXT,
+                risk_score INTEGER
+            )
+            """
         )
-        """
-    )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS patients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            age INTEGER,
-            gender TEXT,
-            blood_group TEXT,
-            phone TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS patients (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                age INTEGER,
+                gender TEXT,
+                blood_group TEXT,
+                phone TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
 
-    existing_cols = {
-        row["name"] for row in cur.execute("PRAGMA table_info(scans)").fetchall()
-    }
-    for col_name, col_type in METRIC_COLUMNS.items():
-        if col_name not in existing_cols:
-            cur.execute(f"ALTER TABLE scans ADD COLUMN {col_name} {col_type}")
+        existing_cols = {
+            row["column_name"]
+            for row in cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'scans'
+                """
+            ).fetchall()
+        }
+
+        if "raw_csv_text" not in existing_cols:
+            cur.execute("ALTER TABLE scans ADD COLUMN IF NOT EXISTS raw_csv_text TEXT")
+
+        for col_name, col_type in METRIC_COLUMNS.items():
+            if col_name not in existing_cols:
+                cur.execute(f"ALTER TABLE scans ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+    else:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id INTEGER,
+                started_at TEXT,
+                finished_at TEXT,
+                raw_csv TEXT,
+                raw_csv_text TEXT,
+                prediction TEXT,
+                explainable TEXT,
+                suggestion TEXT,
+                hr REAL,
+                sbp REAL,
+                dbp REAL,
+                ptt REAL,
+                hrv_rmssd REAL,
+                spo2 REAL,
+                breathing_rate REAL,
+                hr_status TEXT,
+                bp_status TEXT,
+                health_status TEXT,
+                risk_score INTEGER
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS patients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                age INTEGER,
+                gender TEXT,
+                blood_group TEXT,
+                phone TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        existing_cols = {
+            row["name"] for row in cur.execute("PRAGMA table_info(scans)").fetchall()
+        }
+        if "raw_csv_text" not in existing_cols:
+            cur.execute("ALTER TABLE scans ADD COLUMN raw_csv_text TEXT")
+
+        for col_name, col_type in METRIC_COLUMNS.items():
+            if col_name not in existing_cols:
+                cur.execute(f"ALTER TABLE scans ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
     conn.close()
@@ -534,6 +677,17 @@ def backfill_patients_from_scans():
             VALUES (?, ?, NULL, NULL, NULL, NULL)
             """,
             (pid, f"Patient #{pid}"),
+        )
+
+    if USE_POSTGRES:
+        cur.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('patients', 'id'),
+                COALESCE((SELECT MAX(id) FROM patients), 1),
+                true
+            )
+            """
         )
 
     conn.commit()
@@ -583,7 +737,15 @@ def resolve_csv_path(raw_csv_path):
     if os.path.isabs(raw_csv_path):
         return raw_csv_path
 
-    return os.path.join(APP_ROOT, raw_csv_path)
+    candidate_data_root = os.path.join(DATA_ROOT, raw_csv_path)
+    if os.path.exists(candidate_data_root):
+        return candidate_data_root
+
+    candidate_app_root = os.path.join(APP_ROOT, raw_csv_path)
+    if os.path.exists(candidate_app_root):
+        return candidate_app_root
+
+    return candidate_data_root
 
 
 def mark_scan_queued(patient_id):
@@ -644,8 +806,9 @@ def api_config():
     return jsonify({
         "scan_seconds": parse_int(CFG.get("scan_seconds"), default=20) or 20,
         "server_base": CFG.get("server_base", "http://localhost:5000/"),
+        "database_backend": "postgres" if USE_POSTGRES else "sqlite",
         "data_root": DATA_ROOT,
-        "db_path": DB_PATH,
+        "db_path": DB_PATH if not USE_POSTGRES else "DATABASE_URL",
     })
 
 
@@ -698,15 +861,26 @@ def create_patient():
         return jsonify({"success": False, "error": "Name is required"}), 400
 
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO patients (name, age, gender, blood_group, phone)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (name, age, gender, blood_group, phone),
-    )
-    patient_id = cur.lastrowid
+    if USE_POSTGRES:
+        inserted = conn.execute(
+            """
+            INSERT INTO patients (name, age, gender, blood_group, phone)
+            VALUES (?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            (name, age, gender, blood_group, phone),
+        ).fetchone()
+        patient_id = int(inserted["id"])
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO patients (name, age, gender, blood_group, phone)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (name, age, gender, blood_group, phone),
+        )
+        patient_id = cur.lastrowid
     conn.commit()
 
     patient = conn.execute(
@@ -967,7 +1141,7 @@ def get_scan(scan_id):
 def get_scan_waveform(scan_id):
     conn = get_db_connection()
     row = conn.execute(
-        "SELECT id, raw_csv FROM scans WHERE id = ?",
+        "SELECT id, raw_csv, raw_csv_text FROM scans WHERE id = ?",
         (scan_id,),
     ).fetchone()
     conn.close()
@@ -976,13 +1150,16 @@ def get_scan_waveform(scan_id):
         return jsonify({"error": "Scan not found"}), 404
 
     raw_csv_path = row["raw_csv"]
-    abs_csv_path = resolve_csv_path(raw_csv_path)
-
-    if not abs_csv_path or not os.path.exists(abs_csv_path):
-        return jsonify({"error": "CSV file not found for this scan"}), 404
+    raw_csv_text = row.get("raw_csv_text") if isinstance(row, dict) else row["raw_csv_text"]
 
     try:
-        timestamps, ecg, red, ir, _ = parse_scan_csv(abs_csv_path)
+        if raw_csv_text:
+            timestamps, ecg, red, ir, _ = parse_scan_csv_text(raw_csv_text)
+        else:
+            abs_csv_path = resolve_csv_path(raw_csv_path)
+            if not abs_csv_path or not os.path.exists(abs_csv_path):
+                return jsonify({"error": "CSV file not found for this scan"}), 404
+            timestamps, ecg, red, ir, _ = parse_scan_csv(abs_csv_path)
     except Exception as e:
         return jsonify({"error": f"Failed to parse scan CSV: {str(e)}"}), 400
 
@@ -1055,7 +1232,13 @@ def upload_scan_csv():
     file_name = f"scan_upload_{int(time.time())}_{patient_id}_{safe_name}"
     abs_path = os.path.join(DATA_DIR, file_name)
     uploaded_csv.save(abs_path)
-    raw_csv_path = os.path.relpath(abs_path, APP_ROOT).replace("\\", "/")
+    raw_csv_path = abs_path
+    raw_csv_text = None
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            raw_csv_text = f.read()
+    except Exception:
+        raw_csv_text = None
 
     try:
         pred = run_prediction_for_csv(abs_path)
@@ -1068,53 +1251,106 @@ def upload_scan_csv():
     finished_at = finished_dt.isoformat()
 
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO scans (
-            patient_id,
-            started_at,
-            finished_at,
-            raw_csv,
-            prediction,
-            explainable,
-            suggestion,
-            hr,
-            sbp,
-            dbp,
-            ptt,
-            hrv_rmssd,
-            spo2,
-            breathing_rate,
-            hr_status,
-            bp_status,
-            health_status,
-            risk_score
+    if USE_POSTGRES:
+        inserted = conn.execute(
+            """
+            INSERT INTO scans (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv,
+                raw_csv_text,
+                prediction,
+                explainable,
+                suggestion,
+                hr,
+                sbp,
+                dbp,
+                ptt,
+                hrv_rmssd,
+                spo2,
+                breathing_rate,
+                hr_status,
+                bp_status,
+                health_status,
+                risk_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv_path,
+                raw_csv_text,
+                pred["prediction"],
+                pred["explainable"],
+                pred["suggestion"],
+                pred["hr"],
+                pred["sbp"],
+                pred["dbp"],
+                pred["ptt"],
+                pred["hrv_rmssd"],
+                pred["spo2"],
+                pred["breathing_rate"],
+                pred["hr_status"],
+                pred["bp_status"],
+                pred["health_status"],
+                pred["risk_score"],
+            ),
+        ).fetchone()
+        scan_id = int(inserted["id"])
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO scans (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv,
+                raw_csv_text,
+                prediction,
+                explainable,
+                suggestion,
+                hr,
+                sbp,
+                dbp,
+                ptt,
+                hrv_rmssd,
+                spo2,
+                breathing_rate,
+                hr_status,
+                bp_status,
+                health_status,
+                risk_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv_path,
+                raw_csv_text,
+                pred["prediction"],
+                pred["explainable"],
+                pred["suggestion"],
+                pred["hr"],
+                pred["sbp"],
+                pred["dbp"],
+                pred["ptt"],
+                pred["hrv_rmssd"],
+                pred["spo2"],
+                pred["breathing_rate"],
+                pred["hr_status"],
+                pred["bp_status"],
+                pred["health_status"],
+                pred["risk_score"],
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            patient_id,
-            started_at,
-            finished_at,
-            raw_csv_path,
-            pred["prediction"],
-            pred["explainable"],
-            pred["suggestion"],
-            pred["hr"],
-            pred["sbp"],
-            pred["dbp"],
-            pred["ptt"],
-            pred["hrv_rmssd"],
-            pred["spo2"],
-            pred["breathing_rate"],
-            pred["hr_status"],
-            pred["bp_status"],
-            pred["health_status"],
-            pred["risk_score"],
-        ),
-    )
-    scan_id = cur.lastrowid
+        scan_id = cur.lastrowid
     conn.commit()
     conn.close()
 
@@ -1170,6 +1406,7 @@ def receive_result():
     risk_score = parse_int(get_request_value("risk_score"), default=None)
 
     raw_csv_path = get_request_value("raw_csv")
+    raw_csv_text = None
     uploaded_csv = request.files.get("raw_csv")
     if uploaded_csv and uploaded_csv.filename:
         safe_name = secure_filename(uploaded_csv.filename)
@@ -1178,56 +1415,123 @@ def receive_result():
         file_name = f"scan_{int(time.time())}_{patient_id}_{safe_name}"
         abs_path = os.path.join(DATA_DIR, file_name)
         uploaded_csv.save(abs_path)
-        raw_csv_path = os.path.relpath(abs_path, APP_ROOT).replace("\\", "/")
+        raw_csv_path = abs_path
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                raw_csv_text = f.read()
+        except Exception:
+            raw_csv_text = None
+
+    if raw_csv_text is None and raw_csv_path:
+        maybe_path = resolve_csv_path(raw_csv_path)
+        if maybe_path and os.path.exists(maybe_path):
+            try:
+                with open(maybe_path, "r", encoding="utf-8", errors="ignore") as f:
+                    raw_csv_text = f.read()
+            except Exception:
+                raw_csv_text = None
 
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO scans (
-            patient_id,
-            started_at,
-            finished_at,
-            raw_csv,
-            prediction,
-            explainable,
-            suggestion,
-            hr,
-            sbp,
-            dbp,
-            ptt,
-            hrv_rmssd,
-            spo2,
-            breathing_rate,
-            hr_status,
-            bp_status,
-            health_status,
-            risk_score
+    if USE_POSTGRES:
+        inserted = conn.execute(
+            """
+            INSERT INTO scans (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv,
+                raw_csv_text,
+                prediction,
+                explainable,
+                suggestion,
+                hr,
+                sbp,
+                dbp,
+                ptt,
+                hrv_rmssd,
+                spo2,
+                breathing_rate,
+                hr_status,
+                bp_status,
+                health_status,
+                risk_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv_path,
+                raw_csv_text,
+                prediction,
+                explainable,
+                suggestion,
+                hr,
+                sbp,
+                dbp,
+                ptt,
+                hrv_rmssd,
+                spo2,
+                breathing_rate,
+                hr_status,
+                bp_status,
+                health_status,
+                risk_score,
+            ),
+        ).fetchone()
+        scan_id = int(inserted["id"])
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO scans (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv,
+                raw_csv_text,
+                prediction,
+                explainable,
+                suggestion,
+                hr,
+                sbp,
+                dbp,
+                ptt,
+                hrv_rmssd,
+                spo2,
+                breathing_rate,
+                hr_status,
+                bp_status,
+                health_status,
+                risk_score
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                patient_id,
+                started_at,
+                finished_at,
+                raw_csv_path,
+                raw_csv_text,
+                prediction,
+                explainable,
+                suggestion,
+                hr,
+                sbp,
+                dbp,
+                ptt,
+                hrv_rmssd,
+                spo2,
+                breathing_rate,
+                hr_status,
+                bp_status,
+                health_status,
+                risk_score,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            patient_id,
-            started_at,
-            finished_at,
-            raw_csv_path,
-            prediction,
-            explainable,
-            suggestion,
-            hr,
-            sbp,
-            dbp,
-            ptt,
-            hrv_rmssd,
-            spo2,
-            breathing_rate,
-            hr_status,
-            bp_status,
-            health_status,
-            risk_score,
-        ),
-    )
-    scan_id = cur.lastrowid
+        scan_id = cur.lastrowid
     conn.commit()
     conn.close()
 
