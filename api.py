@@ -50,14 +50,34 @@ CFG = load_config()
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
 
-# Storage root strategy:
-# 1) CARDIOSCAN_DATA_DIR env var (recommended on Render)
-# 2) /var/data if available
-# 3) repo/app root (local development)
-DATA_ROOT = (os.environ.get("CARDIOSCAN_DATA_DIR") or "").strip()
-if not DATA_ROOT:
-    DATA_ROOT = "/var/data" if os.path.isdir("/var/data") else APP_ROOT
-os.makedirs(DATA_ROOT, exist_ok=True)
+def _is_writable_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".cardioscan_write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_data_root():
+    env_root = (os.environ.get("CARDIOSCAN_DATA_DIR") or "").strip()
+    candidates = []
+    if env_root:
+        candidates.append(env_root)
+    candidates.extend(["/var/data", APP_ROOT, os.path.join("/tmp", "cardioscan_data")])
+
+    for candidate in candidates:
+        if candidate and _is_writable_dir(candidate):
+            return candidate
+
+    # Last-resort fallback; should be writable in nearly all environments.
+    return APP_ROOT
+
+
+DATA_ROOT = resolve_data_root()
 
 db_name_or_path = CFG.get("local_db", "pico_local.db")
 DB_PATH = db_name_or_path if os.path.isabs(db_name_or_path) else os.path.join(DATA_ROOT, db_name_or_path)
