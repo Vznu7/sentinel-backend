@@ -39,8 +39,19 @@ def load_config():
 
 
 CFG = load_config()
-DB_PATH = os.path.join(APP_ROOT, CFG.get("local_db", "pico_local.db"))
-DATA_DIR = os.path.join(APP_ROOT, "data")
+
+# Storage root strategy:
+# 1) CARDIOSCAN_DATA_DIR env var (recommended on Render)
+# 2) /var/data if available
+# 3) repo/app root (local development)
+DATA_ROOT = (os.environ.get("CARDIOSCAN_DATA_DIR") or "").strip()
+if not DATA_ROOT:
+    DATA_ROOT = "/var/data" if os.path.isdir("/var/data") else APP_ROOT
+os.makedirs(DATA_ROOT, exist_ok=True)
+
+db_name_or_path = CFG.get("local_db", "pico_local.db")
+DB_PATH = db_name_or_path if os.path.isabs(db_name_or_path) else os.path.join(DATA_ROOT, db_name_or_path)
+DATA_DIR = os.path.join(DATA_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
@@ -633,6 +644,8 @@ def api_config():
     return jsonify({
         "scan_seconds": parse_int(CFG.get("scan_seconds"), default=20) or 20,
         "server_base": CFG.get("server_base", "http://localhost:5000/"),
+        "data_root": DATA_ROOT,
+        "db_path": DB_PATH,
     })
 
 

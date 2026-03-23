@@ -14,6 +14,13 @@ This repository contains backend-only files for Render deployment.
 2. Build command: pip install -r requirements.txt
 3. Start command: python api.py
 4. Health check path: /api/health
+5. Add persistent disk in Render and mount it at /var/data (recommended).
+6. Add environment variable CARDIOSCAN_DATA_DIR=/var/data.
+
+## Persistence Check
+After deploy, open /api/config and confirm:
+- data_root is /var/data
+- db_path points to /var/data/pico_local.db
 
 ## Notes
 - Do not commit local runtime database or scan data.
