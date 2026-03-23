@@ -11,5 +11,3 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
-      - key: CARDIOSCAN_DATA_DIR
-        value: /var/data
