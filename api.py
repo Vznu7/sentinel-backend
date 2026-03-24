@@ -155,6 +155,7 @@ scan_state = {
 
 METRIC_COLUMNS = {
     "hr": "REAL",
+    "pr_level": "TEXT",
     "sbp": "REAL",
     "dbp": "REAL",
     "ptt": "REAL",
@@ -422,6 +423,16 @@ def calculate_risk_and_status(features, prediction):
     return hr_status, bp_status, health_status, risk_score
 
 
+def derive_pr_level(hr):
+    if hr is None:
+        return "--"
+    if hr < 60:
+        return "Low"
+    if hr <= 100:
+        return "Normal"
+    return "High"
+
+
 def build_personalized_suggestions(features, prediction):
     points = []
     pred = str(prediction or "").lower()
@@ -486,6 +497,7 @@ def run_prediction_for_csv(csv_path):
             "explainable": "Feature extraction failed",
             "suggestion": "Rescan or upload cleaner CSV data.",
             "hr": None,
+            "pr_level": "--",
             "sbp": None,
             "dbp": None,
             "ptt": None,
@@ -538,11 +550,13 @@ def run_prediction_for_csv(csv_path):
 
     hr_status, bp_status, health_status, risk_score = calculate_risk_and_status(features, prediction)
 
+    hr_val = round(float(features.get("mean_hr")), 1)
     return {
         "prediction": prediction,
         "explainable": explainable,
         "suggestion": suggestion,
-        "hr": round(float(features.get("mean_hr")), 1),
+        "hr": hr_val,
+        "pr_level": derive_pr_level(hr_val),
         "sbp": float(features.get("sbp_est")),
         "dbp": float(features.get("dbp_est")),
         "ptt": round(float(features.get("avg_ptt")), 4),
@@ -575,6 +589,7 @@ def ensure_schema():
                 explainable TEXT,
                 suggestion TEXT,
                 hr REAL,
+                pr_level TEXT,
                 sbp REAL,
                 dbp REAL,
                 ptt REAL,
@@ -634,6 +649,7 @@ def ensure_schema():
                 explainable TEXT,
                 suggestion TEXT,
                 hr REAL,
+                pr_level TEXT,
                 sbp REAL,
                 dbp REAL,
                 ptt REAL,
@@ -1051,6 +1067,7 @@ def get_patient_scans(patient_id):
             explainable,
             suggestion,
             hr,
+            pr_level,
             sbp,
             dbp,
             ptt,
@@ -1133,6 +1150,7 @@ def get_scan(scan_id):
             s.explainable,
             s.suggestion,
             s.hr,
+            s.pr_level,
             s.sbp,
             s.dbp,
             s.ptt,
@@ -1284,6 +1302,7 @@ def upload_scan_csv():
                 explainable,
                 suggestion,
                 hr,
+                pr_level,
                 sbp,
                 dbp,
                 ptt,
@@ -1295,7 +1314,7 @@ def upload_scan_csv():
                 health_status,
                 risk_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (
@@ -1308,6 +1327,7 @@ def upload_scan_csv():
                 pred["explainable"],
                 pred["suggestion"],
                 pred["hr"],
+                pred["pr_level"],
                 pred["sbp"],
                 pred["dbp"],
                 pred["ptt"],
@@ -1335,6 +1355,7 @@ def upload_scan_csv():
                 explainable,
                 suggestion,
                 hr,
+                pr_level,
                 sbp,
                 dbp,
                 ptt,
@@ -1346,7 +1367,7 @@ def upload_scan_csv():
                 health_status,
                 risk_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 patient_id,
@@ -1358,6 +1379,7 @@ def upload_scan_csv():
                 pred["explainable"],
                 pred["suggestion"],
                 pred["hr"],
+                pred["pr_level"],
                 pred["sbp"],
                 pred["dbp"],
                 pred["ptt"],
@@ -1414,6 +1436,7 @@ def receive_result():
     suggestion = get_request_value("suggestion")
 
     hr = parse_float(get_request_value("hr"), default=None)
+    pr_level = get_request_value("pr_level")
     sbp = parse_float(get_request_value("sbp"), default=None)
     dbp = parse_float(get_request_value("dbp"), default=None)
     ptt = parse_float(get_request_value("ptt"), default=None)
@@ -1465,6 +1488,7 @@ def receive_result():
                 explainable,
                 suggestion,
                 hr,
+                pr_level,
                 sbp,
                 dbp,
                 ptt,
@@ -1476,7 +1500,7 @@ def receive_result():
                 health_status,
                 risk_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (
@@ -1489,6 +1513,7 @@ def receive_result():
                 explainable,
                 suggestion,
                 hr,
+                pr_level,
                 sbp,
                 dbp,
                 ptt,
@@ -1516,6 +1541,7 @@ def receive_result():
                 explainable,
                 suggestion,
                 hr,
+                pr_level,
                 sbp,
                 dbp,
                 ptt,
@@ -1527,7 +1553,7 @@ def receive_result():
                 health_status,
                 risk_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 patient_id,
@@ -1539,6 +1565,7 @@ def receive_result():
                 explainable,
                 suggestion,
                 hr,
+                pr_level,
                 sbp,
                 dbp,
                 ptt,
@@ -1576,6 +1603,7 @@ def get_live_scan():
                 s.explainable,
                 s.suggestion,
                 s.hr,
+                s.pr_level,
                 s.sbp,
                 s.dbp,
                 s.ptt,
@@ -1607,6 +1635,7 @@ def get_live_scan():
                 s.explainable,
                 s.suggestion,
                 s.hr,
+                s.pr_level,
                 s.sbp,
                 s.dbp,
                 s.ptt,
