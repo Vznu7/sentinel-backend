@@ -433,6 +433,51 @@ def derive_pr_level(hr):
     return "High"
 
 
+def build_patient_feature_importances(features, model=None):
+    feat_names = ["mean_hr", "hr_std", "avg_ptt", "num_rpeaks", "num_ppg_peaks"]
+    ref_values = {
+        "mean_hr": 78.0,
+        "hr_std": 3.0,
+        "avg_ptt": 0.18,
+        "num_rpeaks": 24.0,
+        "num_ppg_peaks": 24.0,
+    }
+    ref_spans = {
+        "mean_hr": 28.0,
+        "hr_std": 10.0,
+        "avg_ptt": 0.14,
+        "num_rpeaks": 12.0,
+        "num_ppg_peaks": 12.0,
+    }
+
+    base_weights = np.ones(len(feat_names), dtype=float)
+    if model is not None:
+        try:
+            raw_weights = np.asarray(model.feature_importances_, dtype=float)
+            if raw_weights.size == len(feat_names) and np.sum(raw_weights) > 0:
+                base_weights = raw_weights
+        except Exception:
+            pass
+
+    scores = []
+    for idx, name in enumerate(feat_names):
+        value = float(features.get(name, 0.0))
+        deviation = abs(value - ref_values[name]) / max(ref_spans[name], 1e-6)
+        deviation = min(deviation, 3.0)
+        score = float(base_weights[idx]) * (0.35 + deviation)
+        scores.append((name, score))
+
+    total = sum(score for _, score in scores)
+    if total <= 0:
+        return "No feature importance available"
+
+    normalized = sorted(
+        [(name, score / total) for name, score in scores],
+        key=lambda x: -x[1],
+    )
+    return "Feature importances: " + ", ".join([f"{name}:{value:.2f}" for name, value in normalized])
+
+
 def build_personalized_suggestions(features, prediction):
     points = []
     pred = str(prediction or "").lower()
@@ -526,13 +571,7 @@ def run_prediction_for_csv(csv_path):
         except Exception:
             prediction = "unknown"
 
-        try:
-            importances = model.feature_importances_
-            feat_names = ["mean_hr", "hr_std", "avg_ptt", "num_rpeaks", "num_ppg_peaks"]
-            imp_list = sorted(zip(feat_names, importances), key=lambda x: -x[1])
-            explainable = "Feature importances: " + ", ".join([f"{n}:{i:.2f}" for n, i in imp_list])
-        except Exception:
-            explainable = "No feature importance available"
+        explainable = build_patient_feature_importances(features, model)
 
     # Safety layer: treat very abnormal physiology as risk even if model underfits.
     if prediction.lower() == "normal":
